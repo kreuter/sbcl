@@ -906,7 +906,7 @@ print_context_cmd(char **ptr)
 static int
 backtrace_cmd(char **ptr)
 {
-    void lisp_backtrace(int frames);
+    void print_lisp_backtrace(int frames, FILE *f);
     int n;
 
     if (more_p(ptr)) {
@@ -915,7 +915,7 @@ backtrace_cmd(char **ptr)
         n = 100;
 
     printf("Backtrace:\n");
-    lisp_backtrace(n);
+    print_lisp_backtrace(n, stdout);
     return 0;
 }
 
