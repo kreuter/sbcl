@@ -14,6 +14,7 @@
 
 #include "genesis/sbcl.h"
 #include "runtime.h"
+#include "lisp-runtime-options.h"
 
 /* This is the largest ID of any core space that can be saved to disk, so
  * disregarding THREAD-STRUCT-CORE-SPACE-ID and ALIEN-LINKAGE-TABLE-CORE-SPACE-ID.
@@ -33,21 +34,13 @@ struct ndir_entry {
 #define NDIR_ENTRY_LENGTH (sizeof (struct ndir_entry)/sizeof (core_entry_elt_t))
 
 #define RUNTIME_OPTIONS_MAGIC 0x31EBF355
-/* 1 for magic, 1 for core entry size in words, 3 for struct memsize_options fields
- * excluding the 'present_in_core' field */
+/* 1 for magic, 1 for core entry size in words, 3 for sizes */
 #define RUNTIME_OPTIONS_WORDS (1 + 1 + 3)
 
-struct memsize_options {
-    os_vm_size_t dynamic_space_size;
-    os_vm_size_t thread_control_stack_size;
-    os_vm_size_t thread_tls_bytes;
-    int present_in_core;
-};
-
 extern lispobj load_core_file(char *file, os_vm_offset_t file_offset,
-                              int merge_core_pages);
-extern os_vm_offset_t search_for_embedded_core(char *filename,
-                                               struct memsize_options *memsize_options);
+                              struct lisp_runtime_options *lro);
+extern os_vm_offset_t search_for_embedded_core(struct lisp_runtime_options *lro,
+                                               char *filename);
 
 /* arbitrary string identifying this build, embedded in .core files to
  * prevent people mismatching a runtime built e.g. with :SB-SHOW

@@ -32,6 +32,8 @@
 ;;; If something ever needs to be done differently for one OS, then
 ;;; split out the different part into per-os functions.
 
+;; FIXME: *CORE-STRING*'s only use is to initialize *CORE-PATHNAME* in
+;; this file. Could it be deprecated?
 (define-load-time-global *core-string* "")
 (define-load-time-global *core-pathname* nil
     "The absolute pathname of the running SBCL core.")
@@ -84,4 +86,10 @@
    (native-pathname (sb-alien:extern-alien "sbcl_runtime" sb-alien:c-string)))
   (init-var-ignoring-errors
    *sbcl-homedir-pathname* (sb-impl::%sbcl-homedir-pathname))
+  ;; Potential housekeeping: nothing after this point uses
+  ;; core_string, posix_argv, sbcl_runtime_home. posix_argv (but not
+  ;; its elements) was malloc'd, could be freed. core_string isn't
+  ;; always be malloc'd (see runtime.c). sbcl_runtime_home (used in
+  ;; %sbcl-homedir-pathname) is sometimes malloc'd, sometimes NULL,
+  ;; sometimes the static char[] libpath in runtime.c.
   (/show0 "leaving OS-COLD-INIT-OR-REINIT"))

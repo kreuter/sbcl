@@ -110,7 +110,7 @@ lispobj* get_alien_linkage_table_initializer() { return &alien_linkage_values; }
  * If an embedded core is present, this returns the offset into the
  * file to load the core from, or -1 if no core is present. */
 os_vm_offset_t
-search_for_embedded_core(char *filename, struct memsize_options *memsize_options)
+search_for_embedded_core(struct lisp_runtime_options *lro, char *filename)
 {
     extern os_vm_offset_t search_for_elf_core(int);
     lispobj header = 0;
@@ -148,27 +148,33 @@ search_for_embedded_core(char *filename, struct memsize_options *memsize_options
     // is an implicit search for a core embedded in an executable.
     // The two cases can be distinguished based on whether the core is able
     // to set the memsize_options. (Implicit can set them, explicit can't)
-    if (core_start < 0 && memsize_options) {
+    if (core_start < 0 && lro) {
         if (!(core_start = search_for_elf_core(fd)) ||
             lseek(fd, core_start, SEEK_SET) != core_start ||
             read(fd, &header, lispobj_size) != lispobj_size || header != CORE_MAGIC)
             core_start = -1; // reset to invalid
     }
 #endif
-    if (core_start > 0 && memsize_options) {
+    if (core_start > 0 && lro) {
         core_entry_elt_t optarray[RUNTIME_OPTIONS_WORDS];
         // file is already positioned to the first core header entry
         if (read(fd, optarray, sizeof optarray) == sizeof optarray
             && optarray[0] == RUNTIME_OPTIONS_MAGIC) {
-            memsize_options->dynamic_space_size = optarray[2];
-            memsize_options->thread_control_stack_size = optarray[3];
-            memsize_options->thread_tls_bytes = optarray[4];
+            lro->dynamic_space_size = optarray[2];
+            lro->control_stack_size = optarray[3];
+            lro->tls_limit = optarray[4] / N_WORD_BYTES;
             /* If size is RUNTIME_OPTIONS_WORDS+1 then it accepts memsize options at runtime */
-            memsize_options->present_in_core = optarray[1] == RUNTIME_OPTIONS_WORDS ? 1 : 2;
+            lro->embedded_options = optarray[1] == RUNTIME_OPTIONS_WORDS ? 1 : 2;
         }
     }
 lose:
     close(fd);
+    if (lro && (core_start > 0)) {
+        lro->core = filename;
+        lro->saved_executable = 1;
+        /* Saved executables imply --noinform */
+        lro->noinform = 1;
+    }
     return core_start;
 }
 
@@ -552,7 +558,8 @@ static void fix_space(uword_t start, lispobj* end, struct heap_adjust* adj)
 }
 
 int initial_linkage_table_count;
-static void relocate_heap(struct heap_adjust* adj)
+static void relocate_heap(struct heap_adjust* adj,
+                          struct lisp_runtime_options *lro)
 {
 #ifdef LISP_FEATURE_LINKAGE_SPACE
     {
@@ -567,7 +574,7 @@ static void relocate_heap(struct heap_adjust* adj)
     }
 #endif
     if (!adj->n_ranges) return;
-    if (!lisp_startup_options.noinform && SHOW_SPACE_RELOCATION) {
+    if (!lro->noinform && SHOW_SPACE_RELOCATION) {
         int i;
         for (i = 0; i < adj->n_ranges; ++i)
             if (adj->range[i].delta)
@@ -1162,7 +1169,8 @@ void gc_load_corefile_ptes(int card_table_nbits,
                            __attribute__((unused)) core_entry_elt_t total_bytes,
                            os_vm_offset_t offset, int fd,
                            __attribute__((unused)) struct coreparse_space *spaces,
-                           struct heap_adjust *adj)
+                           struct heap_adjust *adj,
+                           struct lisp_runtime_options *lro)
 {
     if (next_free_page != n_ptes)
         lose("n_PTEs=%"PAGE_INDEX_FMT" but expected %"PAGE_INDEX_FMT,
@@ -1230,7 +1238,7 @@ void gc_load_corefile_ptes(int card_table_nbits,
 
     // Adjust for discrepancies between actually-allocated space addresses
     // and desired addresses.
-    relocate_heap(adj);
+    relocate_heap(adj, lro);
 
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
     /* Now determine page characteristics such as object spacing
@@ -1349,7 +1357,8 @@ init_coreparse_spaces(int n, struct coreparse_space* input)
  * -1: default, yes for compressed cores, no otherwise.
  */
 lispobj
-load_core_file(char *file, os_vm_offset_t file_offset, int merge_core_pages)
+load_core_file(char *file, os_vm_offset_t file_offset,
+               struct lisp_runtime_options *lro)
 {
     void *header;
     core_entry_elt_t val, *ptr;
@@ -1458,7 +1467,7 @@ load_core_file(char *file, os_vm_offset_t file_offset, int merge_core_pages)
                               (struct ndir_entry*)ptr,
                               linkage_table_data_page,
                               fd, file_offset,
-                              merge_core_pages, spaces, &adj);
+                              lro->merge_core_pages, spaces, &adj);
             break;
         case LISP_LINKAGE_SPACE_CORE_ENTRY_TYPE_CODE:
             linkage_table_count = ptr[0];
@@ -1474,7 +1483,7 @@ load_core_file(char *file, os_vm_offset_t file_offset, int merge_core_pages)
             // elements = gencgc-card-table-index-nbits, n-ptes, nbytes, data-page
             gc_load_corefile_ptes(ptr[0], ptr[1], ptr[2],
                                   file_offset + (ptr[3] + 1) * os_vm_page_size, fd,
-                                  spaces, &adj);
+                                  spaces, &adj, lro);
             break;
         case INITIAL_FUN_CORE_ENTRY_TYPE_CODE:
             initial_function = adjust_word(&adj, (lispobj)*ptr);
@@ -1492,7 +1501,7 @@ load_core_file(char *file, os_vm_offset_t file_offset, int merge_core_pages)
 #endif
             // simple-fun implies cold-init, not a warm core (it would be a closure then)
             if (widetag_of(native_pointer(initial_function)) == SIMPLE_FUN_WIDETAG
-                && !lisp_startup_options.noinform) {
+                && !(lro->noinform)) {
                 fprintf(stderr, "Initial page table:\n");
                 extern void print_generation_stats(void);
                 print_generation_stats();

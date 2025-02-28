@@ -18,14 +18,20 @@
 # include <unistd.h>
 # include "runtime.h"
 # include "os.h"
+# include "lisp-runtime-options.h"
 #endif
 
 #include "genesis/sbcl.h"
 
 #ifndef __ASSEMBLER__
 
+/* Most of the things determined at startup don't need to exist
+ * indefinitely. The only counterexamples are that cold-init, save,
+ * and maybe a couple things mean to obey --noinform, and that saving
+ * an executable needs the runtime path. The runtime path is a
+ * separate global; maybe it could live here at some point. */
 struct lisp_startup_options {
-    char noinform; // read from Lisp by (at least) src/code/cold-init
+    char noinform;
 };
 extern struct lisp_startup_options lisp_startup_options;
 extern int pre_verify_gen_0; // set and read from Lisp tests

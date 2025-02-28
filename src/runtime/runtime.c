@@ -48,8 +48,9 @@
 
 #include "runtime.h"
 #include "vars.h"
-#include "globals.h"
 #include "os.h"
+#include "lisp-runtime-options.h"
+#include "globals.h"
 #include "interr.h"
 #include "interrupt.h"
 #include "arch.h"
@@ -65,9 +66,30 @@
 struct timespec lisp_init_time;
 
 static char libpath[] = "../lib/sbcl";
-char *sbcl_runtime_home;
-char *sbcl_runtime;
 
+/* These four are where Lisp looks when initializing
+ * *SBCL-HOMEDIR-PATHNAME*, *RUNTIME-PATHNAME*, *CORE-PATHNAME*, and
+ * SB-INT:*CORE-STRING*, and *POSIX-ARGV*. There appear not to be any
+ * uses of sbcl_runtime_home, core_string, and posix_argv after those
+ * are initialized; saving an executable uses sbcl_runtime. */
+/* TODO: except for posix_argv, these want clearer contracts:
+ *
+ * - which are always malloc'd (and so could/should be freed)?
+ * - whether any may point to the same address (& mustn't be freed).
+ * - which ones are always non-NULL & non-empty (i.e., we're able
+ *   to start Lisp without 'em)?
+ * - which are always absolute?
+ * - are any guaranteed to be "truenames"? (If any, why?)
+ */
+char *sbcl_runtime;
+char *sbcl_runtime_home;
+char *core_string;
+#ifdef LISP_FEATURE_WIN32
+    wchar_t
+#else
+    char
+#endif
+    **posix_argv;
 
 /*
  * helper functions for dealing with command line args
@@ -318,15 +340,6 @@ parse_size_arg(char *arg, char *arg_name)
   return res;
 }
 
-#ifdef LISP_FEATURE_WIN32
-    wchar_t
-#else
-    char
-#endif
-    **posix_argv;
-
-char *core_string;
-
 static void print_environment(int argc, char *argv[], char *envp[])
 {
     int n = 0;
@@ -370,75 +383,157 @@ char *dir_name(char *path) {
 }
 
 
-struct lisp_startup_options lisp_startup_options;
-
-struct cmdline_options {
-    char *core;
-#ifdef LISP_FEATURE_WIN32
-    wchar_t
+void
+init_lisp_runtime_options(struct lisp_runtime_options* lro) {
+    lro->noinform = 0;
+    lro->merge_core_pages = -1; /* this means "OS-dependent" */
+    lro->disable_ldb
+#if defined(LISP_FEATURE_SB_LDB)
+        = 0;
 #else
-    char
+        = 1;
 #endif
-     **argv;
-    bool disable_lossage_handler_p;
-    int merge_core_pages;
-};
+    lro->lose_on_corruption = 0;
+    lro->saved_executable = 0;
+    lro->embedded_options = 0;
+    lro->dynamic_space_size = DEFAULT_DYNAMIC_SPACE_SIZE;
+    lro->control_stack_size = DEFAULT_CONTROL_STACK_SIZE;
+    lro->tls_limit = 4096; /* FIXME: define this someplace central? */
+    lro->core = NULL;
+    lro->posix_argv = NULL;
+}
 
-static int is_memsize_arg(char *argv[], int argi, int argc, int *merge_core_pages)
+void
+print_lisp_runtime_options(FILE *f, struct lisp_runtime_options *lro,
+                           char *header) {
+    /* Prints everything in the struct. Broken into a few printf calls
+     * for no deep reason. There's probably some call for a
+     * "flags" arg to suppress some groups of fields. */
+    if (header) fputs(header, f);
+    /* Sizes */
+    fprintf(f, ";  dynamic_space_size: %zd\n\
+;  control_stack_size: %zd\n\
+;  tls_limit: %d\n",
+            lro->dynamic_space_size,
+            lro->control_stack_size,
+            lro->tls_limit);
+    /* Other 1- and 2-bit settings frobbable from the command line */
+    fprintf(f, ";  merge_core_pages: %d\n\
+;  disable_ldb: %d\n\
+;  lose_on_corruption: %d\n\
+;  noinform: %d\n",
+            lro->merge_core_pages,
+            lro->disable_ldb,
+            lro->lose_on_corruption,
+            lro->noinform);
+    /* Stuff we've learned about the core file we'll use */
+    fprintf(f, ";  core: %s\n\
+;  saved_executable: %d\n\
+;  embedded_options: %d\n",
+            /* core must eventually be non-NULL, but it may be NULL at
+             * a moment somebody might want to call this. */
+            (lro->core)?lro->core:"(null)",
+            lro->saved_executable,
+            lro->embedded_options);
+    /* After parse_argv(), the postprocessed args the Lisp toplevel
+     * will get. */
+    if (lro->posix_argv) {
+        for (int i=0; ; i++) {
+#ifdef LISP_FEATURE_WIN32
+          wchar_t *s = lro->posix_argv[i];
+          if (s)
+            fwprintf(f, L";  posix_argv[%d]: %s\n", i, s);
+#else
+          char *s = lro->posix_argv[i];
+          if (s)
+            fprintf(f, ";  posix_argv[%d]: %s\n", i, s);
+#endif
+            else
+                break;
+        }
+    } else
+        /* Same as for core: this will always eventually have at least
+         * the original argv[0], but maybe not at call-time. */
+        fprintf(f, ";  posix_argv: (null)");
+}
+
+
+/* Splat from the lro to some globals. This is broken into "early" and
+ * "late" phases mostly so C can lose() liberally early on. Called
+ * after parse_argv(), but potentially before a core path has been
+ * determined. */
+struct lisp_startup_options lisp_startup_options;
+static void
+early_apply_lisp_runtime_options(struct lisp_runtime_options* lro) {
+    dynamic_space_size = lro->dynamic_space_size;
+    thread_control_stack_size = lro->control_stack_size;
+    dynamic_values_bytes = lro->tls_limit * N_WORD_BYTES;
+    lisp_startup_options.noinform = lro->noinform;
+}
+
+static void
+late_apply_lisp_runtime_options(struct lisp_runtime_options* lro)
+{
+    /* lose_on_corruption_p could be set early, but it has no effect
+     * before enable_lossage_handler().*/
+    lose_on_corruption_p = lro->lose_on_corruption;
+    if (!(lro->disable_ldb))
+        enable_lossage_handler();
+    /* Stash the core path and the processed argv where Lisp looks for
+     * them. They'll need to be processed further there, to do locale
+     * conversion. */
+    core_string = lro->core;
+    /* This assignment could happen in
+     * early_apply_lisp_runtime_options(), but lro->core isn't always
+     * set by that time. It seemed best to keep them together. (If
+     * it's not important to defer the final attempts at finding a
+     * core path, both core_string and posix_argv assignments should
+     * go into early_apply_lisp_runtime_options.) */
+    posix_argv = lro->posix_argv;
+}
+
+static int
+is_memsize_arg(struct lisp_runtime_options *lro, char *argv[], int argi, int argc)
 {
     char *arg = argv[argi];
     if (!strcmp(arg, "--dynamic-space-size")) {
         if ((argi+1) >= argc) lose("missing argument for --dynamic-space-size");
-        dynamic_space_size = parse_size_arg(argv[argi+1],
-                                            "--dynamic-space-size");
+        lro->dynamic_space_size = parse_size_arg(argv[argi+1],
+                                                 "--dynamic-space-size");
         return 2; // return number of elements of argv[] consumed
     }
     if (!strcmp(arg, "--control-stack-size")) {
         if ((argi+1) >= argc) lose("missing argument for --control-stack-size");
-        thread_control_stack_size = parse_size_arg(argv[argi+1], "--control-stack-size");
+        lro->control_stack_size = parse_size_arg(argv[argi+1], "--control-stack-size");
         return 2;
     }
     if (!strcmp(arg, "--tls-limit")) {
         // this is not named "tls-size" because "size" is not the
         // best measurement for how many symbols to allow
         if ((argi+1) >= argc) lose("missing argument for --tls-limit");
-        dynamic_values_bytes = N_WORD_BYTES * atoi(argv[argi+1]);
+        lro->tls_limit = atoi(argv[argi+1]);
         return 2;
     }
     if (!strcmp(arg, "--merge-core-pages")) {
-        *merge_core_pages = 1;
+        lro->merge_core_pages = 1;
         return 1;
     }
     if (!strcmp(arg, "--no-merge-core-pages")) {
-        *merge_core_pages = 0;
+        lro->merge_core_pages = 0;
         return 1;
     }
     return 0;
 }
 
-static struct cmdline_options
-parse_argv(struct memsize_options memsize_options,
-           int argc, char *argv[], char *envp[], char *core)
+static void
+parse_argv(struct lisp_runtime_options *lro,
+           int argc, char *argv[], char *envp[])
 {
-#ifdef LISP_FEATURE_WIN32
-    wchar_t
-#else
-        char
-#endif
-        **sbcl_argv = 0;
-    /* other command line options */
-    bool disable_lossage_handler_p
-#if defined(LISP_FEATURE_SB_LDB)
-        = 0;
-#else
-        = 1;
-#endif
-    bool debug_environment_p = 0;
-    int merge_core_pages = -1;
-
     int argi = 1;
     int n_consumed;
-    if (memsize_options.present_in_core) {
+    bool debug_environment_p = 0;
+
+    if (lro->embedded_options == 2) {
         /* Our arg parsing isn't (and can't be) integrated with the application's,
          * but we really want users to be able to override the heap size.
          * So don't parse most options, but _do_ parse memory size options and/or
@@ -453,42 +548,31 @@ parse_argv(struct memsize_options memsize_options,
          * The rationale for passing "--" through is that we're trying to be
          * as uninvasive as possible. Let's hope that nobody needs to put a "--"
          * to the left of any of the memory size options */
-        dynamic_space_size = memsize_options.dynamic_space_size;
-        thread_control_stack_size = memsize_options.thread_control_stack_size;
-        dynamic_values_bytes = memsize_options.thread_tls_bytes;
-        if (memsize_options.present_in_core == 2) {
-            int stop_parsing = 0; // have we seen '--'
-            int output_index = 1;
-#ifndef LISP_FEATURE_WIN32
-            sbcl_argv = checked_malloc((argc + 1) * sizeof(char *));
-            char **argv_source = argv;
-#else
-            int wargc;
-            wchar_t **argv_source;
-            argv_source = CommandLineToArgvW(GetCommandLineW(), &wargc);
-            sbcl_argv = checked_malloc((wargc + 1) * sizeof(wchar_t *));
-#endif
-            sbcl_argv[0] = argv_source[0];
+        int stop_parsing = 0; // have we seen '--'
+        int output_index = 1;
 
-            while (argi < argc) {
-                if (stop_parsing) // just copy it over
-                    sbcl_argv[output_index++] = argv_source[argi++];
-                else if (!strcmp(argv[argi], "--")) // keep it, but parse nothing else
-                    sbcl_argv[output_index++] = argv_source[argi++], stop_parsing = 1;
-                else if ((n_consumed = is_memsize_arg(argv, argi, argc, &merge_core_pages)))
-                    argi += n_consumed; // eat it
-                else // default action - copy it
-                    sbcl_argv[output_index++] = argv_source[argi++];
-            }
-            sbcl_argv[output_index] = 0;
-        } else {
 #ifndef LISP_FEATURE_WIN32
-            sbcl_argv = argv;
+        lro->posix_argv = checked_malloc((argc + 1) * sizeof(char *));
+        char **argv_source = argv;
 #else
-            int wargc;
-            sbcl_argv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+        int wargc;
+        wchar_t **argv_source;
+        argv_source = CommandLineToArgvW(GetCommandLineW(), &wargc);
+        lro->posix_argv = checked_malloc((wargc + 1) * sizeof(wchar_t *));
 #endif
+        lro->posix_argv[0] = argv_source[0];
+
+        while (argi < argc) {
+            if (stop_parsing) // just copy it over
+                lro->posix_argv[output_index++] = argv_source[argi++];
+            else if (!strcmp(argv[argi], "--")) // keep it, but parse nothing else
+                lro->posix_argv[output_index++] = argv_source[argi++], stop_parsing = 1;
+            else if ((n_consumed = is_memsize_arg(lro, argv, argi, argc)))
+                argi += n_consumed; // eat it
+            else // default action - copy it
+                lro->posix_argv[output_index++] = argv_source[argi++];
         }
+        lro->posix_argv[output_index] = 0;
     } else {
         bool end_runtime_options = 0;
         /* Parse our any of the command-line options that we handle from C,
@@ -500,23 +584,23 @@ parse_argv(struct memsize_options memsize_options,
                  * runtime option, it is equivalent to --noinform.
                  * This exits, and does not increment argi, so that
                  * TOPLEVEL-INIT sees the option. */
-                lisp_startup_options.noinform = 1;
+                lro->noinform = 1;
+                lro->disable_ldb = 1;
+                lro->lose_on_corruption = 1;
                 end_runtime_options = 1;
-                disable_lossage_handler_p = 1;
-                lose_on_corruption_p = 1;
                 break;
             } else if (0 == strcmp(arg, "--noinform")) {
-                lisp_startup_options.noinform = 1;
+                lro->noinform = 1;
                 ++argi;
             } else if (0 == strcmp(arg, "--core")) {
-                if (core) {
+                if (lro->core) {
                     lose("more than one core file specified");
                 } else {
                     ++argi;
                     if (argi >= argc) {
                         lose("missing filename for --core argument");
                     }
-                    core = copied_string(argv[argi]);
+                    lro->core = copied_string(argv[argi]);
                     ++argi;
                 }
             } else if (0 == strcmp(arg, "--help")) {
@@ -529,16 +613,16 @@ parse_argv(struct memsize_options memsize_options,
                 /* As in "--help" case, I think this is expected. */
                 print_version();
                 exit(0);
-            } else if ((n_consumed = is_memsize_arg(argv, argi, argc, &merge_core_pages))) {
+            } else if ((n_consumed = is_memsize_arg(lro, argv, argi, argc))) {
                 argi += n_consumed;
             } else if (0 == strcmp(arg, "--debug-environment")) {
                 debug_environment_p = 1;
                 ++argi;
             } else if (0 == strcmp(arg, "--disable-ldb")) {
-                disable_lossage_handler_p = 1;
+                lro->disable_ldb = 1;
                 ++argi;
             } else if (0 == strcmp(arg, "--lose-on-corruption")) {
-                lose_on_corruption_p = 1;
+                lro->lose_on_corruption = 1;
                 ++argi;
             } else if (0 == strcmp(arg, "--end-runtime-options")) {
                 end_runtime_options = 1;
@@ -561,8 +645,8 @@ parse_argv(struct memsize_options memsize_options,
 #ifndef LISP_FEATURE_WIN32
             /* (argc - argi) for the arguments, one for the binary,
                and one for the terminating NULL. */
-            sbcl_argv = checked_malloc((2 + argc - argi) * sizeof(char *));
-            sbcl_argv[0] = argv[0];
+            lro->posix_argv = checked_malloc((2 + argc - argi) * sizeof(char *));
+            lro->posix_argv[0] = argv[0];
             while (argi < argc) {
                 char *arg = argv[argi++];
                 /* If we encounter --end-runtime-options for the first
@@ -574,7 +658,7 @@ parse_argv(struct memsize_options memsize_options,
                     0 == strcmp(arg, "--end-runtime-options")) {
                     lose("bad runtime option \"%s\"", argi0);
                 }
-                sbcl_argv[argj++] = arg;
+                lro->posix_argv[argj++] = arg;
             }
 #else
             /* The runtime options are processed as chars above, which may
@@ -583,31 +667,32 @@ parse_argv(struct memsize_options memsize_options,
             int wargc;
             wchar_t** wargv;
             wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
-            sbcl_argv = checked_malloc((((argi < wargc) ? (wargc - argi) : 0) + 2)
+            lro->posix_argv = checked_malloc((((argi < wargc) ? (wargc - argi) : 0) + 2)
                                           * sizeof(wchar_t *));
-            sbcl_argv[0] = wargv[0];
+            lro->posix_argv[0] = wargv[0];
             while (argi < wargc) {
                 wchar_t *warg = wargv[argi++];
                 if (!end_runtime_options &&
                     0 == wcscmp(warg, L"--end-runtime-options")) {
                     lose("bad runtime option \"%s\"", argi0);
                 }
-                sbcl_argv[argj++] = warg;
+                lro->posix_argv[argj++] = warg;
             }
 #endif
-            sbcl_argv[argj] = 0;
+            lro->posix_argv[argj] = 0;
         }
     }
     if (debug_environment_p) {
         print_environment(argc, argv, envp);
+        /* If somebody's using this undocumented option to see the
+         * argc and argv, might as well show them the post-parsed
+         * runtime settings and the argv we'll give to the toplevel,
+         * too.. (At this point, the core might still be unknown.) */
+        puts("; ");
+        print_lisp_runtime_options(stdout, lro, "; Runtime Settings & Toplevel Arguments:\n");
     }
 
-    struct cmdline_options o;
-    o.core = core;
-    o.argv = sbcl_argv;
-    o.disable_lossage_handler_p = disable_lossage_handler_p;
-    o.merge_core_pages = merge_core_pages;
-    return o;
+    return;
 }
 
 int
@@ -634,15 +719,10 @@ initialize_lisp(int argc, char *argv[], char *envp[])
 #endif
 #endif
 
-    /* the name of the core file we're to execute. Note that this is
-     * a malloc'ed string which should be freed eventually. */
-    char *core = 0;
-
+    struct lisp_runtime_options lro;
     os_vm_offset_t embedded_core_offset = 0;
 
     lispobj initial_function;
-    struct memsize_options memsize_options;
-    memsize_options.present_in_core = 0;
     extern void sb_query_os_page_size();
     sb_query_os_page_size();
 
@@ -654,26 +734,29 @@ initialize_lisp(int argc, char *argv[], char *envp[])
     thread_sigmask(SIG_SETMASK, &blockable_sigset, 0);
 #endif
 
+    init_lisp_runtime_options(&lro);
     /* Check early to see if this executable has an embedded core,
-     * which also populates runtime_options if the core has runtime
+     * which also populates lisp_runtime_options if the core has runtime
      * options */
     sbcl_runtime = os_get_runtime_executable_path();
     if (sbcl_runtime) {
-        os_vm_offset_t offset = search_for_embedded_core(sbcl_runtime, &memsize_options);
+        os_vm_offset_t offset = search_for_embedded_core(&lro, sbcl_runtime);
         if (offset != -1) {
-            core = sbcl_runtime;
+            /* FIXME: lro.core eventually becomes core_string.  Decide
+             * whether that's supposed to be freed, and if so, copy
+             * sbcl_runtime. */
+            lro.core = sbcl_runtime;
             embedded_core_offset = offset;
         }
     }
 
-    if (!core) {
+    if (!lro.core) {
         char *exe_path = search_for_executable(argv[0]);
         if (exe_path && !(sbcl_runtime && strcmp(sbcl_runtime, exe_path) == 0)) {
-            os_vm_offset_t offset = search_for_embedded_core(exe_path, &memsize_options);
+            os_vm_offset_t offset = search_for_embedded_core(&lro, exe_path);
             if (offset != -1) {
-                free(core);
                 sbcl_runtime = exe_path;
-                core = exe_path;
+                lro.core = exe_path;
                 embedded_core_offset = offset;
             } else {
                 if (!sbcl_runtime)
@@ -690,7 +773,8 @@ initialize_lisp(int argc, char *argv[], char *envp[])
         if (!(sbcl_runtime_home = dir_name(sbcl_runtime)))
             sbcl_runtime_home = libpath;
 
-    struct cmdline_options options = parse_argv(memsize_options, argc, argv, envp, core);
+    parse_argv(&lro, argc, argv, envp);
+    early_apply_lisp_runtime_options(&lro);
 
     /* Align down to multiple of page_table page size, and to the appropriate
      * stack alignment. */
@@ -709,8 +793,7 @@ initialize_lisp(int argc, char *argv[], char *envp[])
     gc_init();
 
     /* If no core file was specified, look for one. */
-    core = options.core;
-    if (!core && !(core = search_for_core())) {
+    if (!(lro.core) && !(lro.core = search_for_core())) {
       /* Try resolving symlinks */
       if (sbcl_runtime) {
         if (sbcl_runtime_home != libpath)
@@ -722,7 +805,7 @@ initialize_lisp(int argc, char *argv[], char *envp[])
         free(real);
         if (!sbcl_runtime_home)
           goto lose;
-        if(!(core = search_for_core()))
+        if(!(lro.core = search_for_core()))
           goto lose;
       } else {
       lose:
@@ -730,10 +813,7 @@ initialize_lisp(int argc, char *argv[], char *envp[])
       }
     }
 
-    if (embedded_core_offset)
-        lisp_startup_options.noinform = 1;
-
-    if (!lisp_startup_options.noinform) {
+    if (!lro.noinform) {
         print_banner();
         fflush(stdout);
     }
@@ -746,7 +826,7 @@ initialize_lisp(int argc, char *argv[], char *envp[])
          * before we reach this block, so that there is no observable
          * difference between "embedded" and "bare" images given to
          * --core. */
-        os_vm_offset_t offset = search_for_embedded_core(core, 0);
+        os_vm_offset_t offset = search_for_embedded_core(0, lro.core);
         if (offset != -1)
             embedded_core_offset = offset;
     }
@@ -757,8 +837,12 @@ initialize_lisp(int argc, char *argv[], char *envp[])
      * and before any random malloc() calls occur improves the chance
      * of mapping dynamic space at our preferred address (if movable).
      * If not movable, it was already mapped in allocate_spaces(). */
-    initial_function = load_core_file(core, embedded_core_offset,
-                                      options.merge_core_pages);
+    /* ("before any random malloc() calls"? There have been many
+       already in argv parsing, absolutizing the runtime path, and
+       looking around for a core.) */
+    initial_function = load_core_file(lro.core,
+                                      embedded_core_offset,
+                                      &lro);
     if (initial_function == NIL) {
         lose("couldn't find initial function");
     }
@@ -770,8 +854,7 @@ initialize_lisp(int argc, char *argv[], char *envp[])
     define_var("nil", NIL, 1);
     define_var("t", LISP_T, 1);
 
-    if (!options.disable_lossage_handler_p)
-        enable_lossage_handler();
+    late_apply_lisp_runtime_options(&lro);
 
     ensure_undefined_alien();
     os_link_runtime();
@@ -806,12 +889,6 @@ initialize_lisp(int argc, char *argv[], char *envp[])
 /*     wos_install_interrupt_handlers(handler); */
     wos_install_interrupt_handlers(&exception_frame);
 #endif
-
-    /* Pass core filename and the processed argv into Lisp. They'll
-     * need to be processed further there, to do locale conversion.
-     */
-    core_string = core;
-    posix_argv = options.argv;
 
     create_main_lisp_thread(initial_function);
     return 0;
