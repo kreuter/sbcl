@@ -449,6 +449,7 @@ void create_main_lisp_thread(lispobj function) {
 void sb_posix_after_fork() { // for use by sb-posix:fork
     struct thread* th = get_sb_vm_thread();
     th->os_kernel_tid = get_nonzero_tid();
+    thread_interrupt_data(th).pending_handler = 0;
 #ifdef LISP_FEATURE_DARWIN
     extern void darwin_reinit();
     darwin_reinit();

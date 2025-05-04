@@ -123,3 +123,67 @@
           (assert (and (null nbytes)
                        (= errno sb-unix:epipe))))))
     (sb-unix:unix-close write-side)))
+
+
+;; WITHOUT-INTERRUPTS saves signal data and runs a handler in a later
+;; unwind. If a fork() happens between save and unwind, the child
+;; should not run the handler. This is for agreement with POSIX fork()
+;; "The set of signals pending for the child process shall be
+;; initialized to the empty set."
+;; https://pubs.opengroup.org/onlinepubs/9799919799/functions/fork.html
+
+#+unix ;unreadable on Windows b/c some of sb-posix doesn't exist
+(with-test (:name :fork-during-without-interrupts)
+  (flet ((fork* ()
+           ;; Ensure the parent gets a SIGINT before the syscall.
+           ;; If necessary, put a (sleep <x>) after to give the OS time
+           ;; to deliver the self-interrupt.
+           (sb-posix:kill (sb-posix:getpid) sb-posix:sigint)
+           ;; Note: this does not do everything sb-posix:fork does.
+           ;; Not trying to be a complete binding to fork(), just a
+           ;; tool for exercising WITHOUT-INTERRUPTS.
+           (let ((pid
+                  (sb-alien:alien-funcall
+                   (sb-alien:extern-alien "fork" (function sb-alien:int)))))
+             (when (zerop pid)
+               (sb-alien:alien-funcall
+                (sb-alien:extern-alien
+                 "sb_posix_after_fork" (function sb-alien:void))))
+             pid))
+         (waitpid* (pid)
+           (multiple-value-bind (ignore status) (sb-posix:waitpid pid 0)
+             (declare (ignore ignore))
+             (let ((exited (sb-posix:wifexited status)))
+               (values (if exited :exited :signaled)
+                       (if exited
+                           (sb-posix:wexitstatus status)
+                           (sb-posix:wtermsig status)))))))
+    (let (child handled)
+      (block nil
+        (handler-bind
+            ((sb-sys:interactive-interrupt
+              (lambda (ignore)
+                (declare (ignore ignore))
+                (setq handled t)
+                (return))))
+          (when (zerop
+                 ;; This WITHOUT-INTERRUPTS both ensures CHILD gets
+                 ;; assigned in the parent, and causes the parent to
+                 ;; save the interrupt data for later processing.
+                 (sb-sys:without-interrupts (setq child (fork*)))
+                 ;; In both the parent and the child, the SIGINT
+                 ;; will be processed "here", so to speak.
+                 )
+            ;; XXX: without :RECKLESSLY-P the child never exits?
+            ;; (:RECKLESSLY-P T doesn't affect this test, though.)
+            (sb-ext:quit :unix-status 0 :recklessly-p t))))
+      (etypecase  child
+        ((eql 0)
+         ;; Same here for :RECKLESSLY-P,
+         (sb-ext:quit :unix-status 1 :recklessly-p t))
+        ((integer 1)
+         (multiple-value-bind (exited number)
+             (waitpid* child)
+           (assert handled)
+           (assert (eql :exited exited))
+           (assert (zerop number))))))))
