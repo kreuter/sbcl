@@ -559,7 +559,7 @@ Experimental: interface subject to change."
            (cases)))))
 ) ; end MACROLET
 
-(define-condition memory-fault-error (system-condition error) ()
+(define-condition memory-fault-error (#+unix posix-signal system-condition error) ()
   (:report
    (lambda (condition stream)
      (let* ((faultaddr (system-condition-address condition))

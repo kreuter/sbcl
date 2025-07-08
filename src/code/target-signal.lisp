@@ -104,22 +104,30 @@
 ;;;; default LISP signal handlers
 ;;;;
 ;;;; Most of these just call ERROR to report the presence of the signal.
-
-;;; SIGINT is handled like BREAK, except that ANSI BREAK ignores
-;;; *DEBUGGER-HOOK*, but we want SIGINT's BREAK to respect it, so that
-;;; SIGINT in --disable-debugger mode will cleanly terminate the system
-;;; (by respecting the *DEBUGGER-HOOK* established in that mode).
+(define-alien-routine ("terminate_by_signal" %terminate-by-signal) void (sig int))
+(define-condition simple-posix-signal-error (simple-error posix-signal) ())
 (macrolet
-  ((define-signal-handler (name what &optional (function 'error))
+  ((define-signal-handler (name what)
     `(defun ,name (signal info context)
-       (declare (ignore signal info))
+       (declare (ignore info))
        (declare (type system-area-pointer context))
        (/show "in Lisp-level signal handler" ,(symbol-name name)
               (sap-int context))
-       (with-interrupts
-         (,function ,(concatenate 'simple-string what " at #X~X")
-                    (with-alien ((context (* os-context-t) context))
-                      (sap-int (sb-vm:context-pc context))))))))
+       (with-alien ((context (* os-context-t) context))
+         (let ((address (sap-int (sb-vm:context-pc context))))
+           (with-interrupts
+              (restart-case
+                  (error 'simple-posix-signal-error
+                         :number signal
+                         :context context
+                         :address  address
+                         :format-control
+                         ,(concatenate 'simple-string what " at #X~X")
+                         :format-arguments (list address))
+                (terminate-by-signal ()
+                  :report (lambda (stream)
+                            (format stream "Terminate SBCL with signal ~D." signal))
+                  (%terminate-by-signal signal)))))))))
 
 (define-signal-handler sigill-handler "illegal instruction")
 #-(or linux android haiku)
@@ -129,9 +137,14 @@
 (define-signal-handler sigsys-handler "bad argument to a system call")
 ) ; end MACROLET
 
+;;; SIGINT is handled like BREAK, except that ANSI BREAK ignores
+;;; *DEBUGGER-HOOK*, but we want SIGINT's BREAK to respect it, so that
+;;; SIGINT in --disable-debugger mode will cleanly terminate the system
+;;; (by respecting the *DEBUGGER-HOOK* established in that mode).
+;;; [Uh, this is also unlike BREAK in that a condition gets SIGNALed.]
 (defun sigint-handler (signal info
                        sb-kernel:*current-internal-error-context*)
-  (declare (ignore signal info))
+  (declare (ignore info))
   (flet ((interrupt-it ()
            ;; SB-KERNEL:*CURRENT-INTERNAL-ERROR-CONTEXT* will
            ;; either be bound in this thread by SIGINT-HANDLER or
@@ -139,13 +152,20 @@
            (with-alien ((context (* os-context-t)
                                  sb-kernel:*current-internal-error-context*))
              (with-interrupts
-               (let ((int (make-condition 'interactive-interrupt
-                                          :context context
-                                          :address (sap-int (sb-vm:context-pc context)))))
-                 ;; First SIGNAL, so that handlers can run.
-                 (signal int)
-                 ;; Then enter the debugger like BREAK.
-                 (%break 'sigint int))))))
+                 (let ((int (make-condition 'interactive-interrupt
+                                            :number signal
+                                            :context context
+                                            :address (sap-int (sb-vm:context-pc context)))))
+                   (restart-bind ((terminate-by-signal
+                                    (lambda () (%terminate-by-signal signal))
+                                    :report-function
+                                    (lambda (stream)
+                                      (format stream  "Terminate SBCL with signal ~D." signal))))
+                     (with-condition-restarts int (list (find-restart 'terminate-by-signal))
+                         ;; First SIGNAL, so that handlers can run.
+                         (signal int)
+                         ;; Then enter the debugger like BREAK.
+                         (%break 'sigint int))))))))
     #+sb-safepoint
     (let ((target (sb-thread::foreground-thread)))
       ;; Note that INTERRUPT-THREAD on *CURRENT-THREAD* doesn't actually

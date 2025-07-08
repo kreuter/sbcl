@@ -759,9 +759,15 @@
 #-win32
 (defun memory-fault-error (context-sap address-sap)
   (declare (ignore context-sap))
-  (let ((sb-debug:*stack-top-hint* (find-interrupted-frame)))
-    (error 'memory-fault-error
-           :address (sap-int address-sap))))
+  (let ((sb-debug:*stack-top-hint* (find-interrupted-frame))
+        (number (extern-alien "sb_memory_fault_signal" int)))
+    (restart-case (error 'memory-fault-error
+                         :address (sap-int address-sap)
+                         :number number)
+      (terminate-by-signal ()
+        :report (lambda (stream)
+                  (format stream "Terminate SBCL with a signal ~D." number))
+        (sb-unix::%terminate-by-signal number)))))
 
 ;;; This is SIGTRAP / EXCEPTION_BREAKPOINT that runtime could not deal
 ;;; with. Prior to Windows we just had a Lisp side handler for

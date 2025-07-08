@@ -2414,7 +2414,22 @@ you did not expect to see this message, please report it."
      (format stream "Unhandled breakpoint/trap at #x~X."
              (system-condition-address condition)))))
 
-(define-condition interactive-interrupt (system-condition serious-condition) ()
+;; A mixin class for conditions representing a POSIX signal. This gets
+;; defined everywhere, but mixed-in only on Unix.
+(define-condition posix-signal (system-condition)
+  ((number :initarg :number :reader posix-signal-number :type (integer 1)))
+  (:documentation "The type of condition signaled upon receipt of
+a POSIX signal. POSIX-SIGNAL-NUMBER returns the signal number.")
+  (:report
+   (lambda (condition stream)
+     (format stream "POSIX signal ~D at #x~X."
+             (posix-signal-number condition)
+             (system-condition-address condition)))))
+
+;; On Unix, this one always and only represents a SIGINT.
+(define-condition interactive-interrupt
+    (#+unix posix-signal system-condition serious-condition)
+  ()
   (:report
    (lambda (condition stream)
      (format stream "Interactive interrupt at #x~X."

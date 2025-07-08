@@ -2039,6 +2039,32 @@ void install_handler(int signal, lispobj handler)
 #endif
 }
 
+/* Some kinds of parent program (e.g., shells, systemd) sometimes care
+ * whether a child exited or terminated by signal. For signals where
+ * the OS's default action terminates a process, the Lisp condition
+ * gets associated with a restart that calls this. */
+#ifndef LISP_FEATURE_WIN32
+void
+terminate_by_signal(int sig) {
+    signal(sig, SIG_DFL);
+    raise(sig);
+    /* If we're still here, something is wrong: SIGNAL isn't one that
+     * terminates the process, or another thread clobbered the default
+     * handler or something. Either way, our contract is to terminate
+     * the process. */
+    lose("Unexpected survival of signal %d", sig);
+}
+/* SB-KERNEL:MEMORY-FAULT-ERROR needs to know the signal number so it
+ * can pass it down to terminate_by_signal(). */
+/* TODO: clean out FreeBSD<7's use of SIGBUS. (FreeBSD<7.0 has been
+   EOL'd for 14.5 years as of this writing.) */
+#if defined(LISP_FEATURE_FREEBSD)
+int sb_memory_fault_signal = SIGSEGV;
+#else
+int sb_memory_fault_signal = SIG_MEMORY_FAULT;
+#endif
+#endif
+
 /* This must not go through lisp as it's allowed anytime, even when on
  * the altstack. */
 void

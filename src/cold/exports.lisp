@@ -406,6 +406,13 @@
    "TIMER" "MAKE-TIMER" "TIMER-NAME" "TIMER-SCHEDULED-P"
    "SCHEDULE-TIMER" "UNSCHEDULE-TIMER" "LIST-ALL-TIMERS"
 
+   ;; These are defined everywhere, but used only on Unix. External in
+   ;; SB-EXT so that users may refer to them; there's no other package
+   ;; for OS-specific extensions.
+   "POSIX-SIGNAL"        ; condition class
+   "POSIX-SIGNAL-NUMBER" ; condition accessor
+   "TERMINATE-BY-SIGNAL" ; restart
+
    ;; versioning utility
 
    "ASSERT-VERSION->="
