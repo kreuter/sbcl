@@ -56,6 +56,9 @@ provide bindings for printer control variables.")
   nil
   "*READTABLE* for the debugger")
 
+;; FIXME: this accessible in CL-USER. What's its contract?  What are
+;; users supposed to infer from it having a true value? Is a debugger
+;; hook allowed or expected to bind this? etc.
 (defvar *in-the-debugger* nil
   "This is T while in the debugger.")
 
@@ -1173,6 +1176,8 @@ the current thread are replaced with dummy objects which can safely escape."
 ;;; compatibility with 1968-style use of global variables to control
 ;;; per-stream i/o properties; there's really no way to get this
 ;;; quite right, but we do what we can.
+;; FIXME: if these rebindings are essential, doesn't INTERNAL-DEBUG
+;; need them, too?
 (defun funcall-with-debug-io-syntax (fun &rest rest)
   (declare (type function fun))
   ;; Try to force the other special variables into a useful state.
@@ -1263,6 +1268,22 @@ the current thread are replaced with dummy objects which can safely escape."
       (t
        hint))))
 
+;; Historically, the outermost invocation of this debugger has written
+;; the condition & maybe other stuff on *ERROR-OUTPUT* before
+;; switching to *DEBUG-IO* for user interaction. (1) This convention
+;; makes for a slightly clunky interactive experience while
+;; *ERROR-OUTPUT* is rebound (or is its default value while stderr
+;; isn't the tty). (2) A user might not want any report recorded on
+;; error output when they address the problem and resume the
+;; program. (Cf. when a program contains a handler that fixes a
+;; problem and resumes the program, no condition report is
+;; unconditionally written on error output; why should one be because
+;; (and before!) a human gets a chance to handle things?) IOW, having
+;; a debugger write on *ERROR-OUTPUT* seems a preference at
+;; best. Let's have the debugger write its initial output to a
+;; variable the user can customize.
+(defvar *debug-condition-output* (make-synonym-stream '*error-output*)
+  "The stream to which the outermost debugger sends condition reports.")
 (defun invoke-debugger (condition)
   "Enter the debugger."
   (let ((*stack-top-hint* (resolve-stack-top-hint))
@@ -1276,9 +1297,14 @@ the current thread are replaced with dummy objects which can safely escape."
     ;; Elsewhere in the system, we use the SANE-PACKAGE function for
     ;; this, but here causing an exception just as we're trying to handle
     ;; an exception would be confusing, so instead we use a special hack.
+    ;; FIXME: Why is this an assignment rather than dynamic binding?
+    ;; Why isn't this in FUNCALL-WITH-DEBUG-IO-SYNTAX?
     (unless (package-name *package*)
       (setf *package* (find-package :cl-user))
-      (format *error-output*
+      ;; Rationale for *DEBUG-CONDITION-OUTPUT*: frobbing *PACKAGE* is
+      ;; effectively setup for the reading & printing the built-in
+      ;; debugger will do, so route it the same as the debugger will.
+      (format *debug-condition-output*
               "The value of ~S was not an undeleted PACKAGE. It has been ~
                reset to ~S."
               '*package* *package*))
@@ -1317,17 +1343,15 @@ the current thread are replaced with dummy objects which can safely escape."
         (*debug-restarts* (compute-restarts condition))
         (*nested-debug-condition* nil))
     (handler-case
-        ;; (The initial output here goes to *ERROR-OUTPUT*, because the
-        ;; initial output is not interactive, just an error message, and
-        ;; when people redirect *ERROR-OUTPUT*, they could reasonably
-        ;; expect to see error messages logged there, regardless of what
-        ;; the debugger does afterwards.)
+        ;; (The initial output here goes to *DEBUG-CONDITION-OUTPUT*, so
+        ;; that the user can control whether printing the condition &
+        ;; things counts as "non-interactive".)
         (unless (typep condition 'step-condition)
-          (%print-debugger-invocation-reason condition *error-output*))
+          (%print-debugger-invocation-reason condition *debug-condition-output*))
       (error (condition)
         (setf *nested-debug-condition* condition)
         (let ((ndc-type (type-of *nested-debug-condition*)))
-          (format *error-output*
+          (format *debug-condition-output*
                   "~&~@<(A ~S was caught when trying to print ~S when ~
                       entering the debugger. Printing was aborted and the ~
                       ~S was stored in ~S.)~@:>~%"
@@ -1337,7 +1361,7 @@ the current thread are replaced with dummy objects which can safely escape."
                   '*nested-debug-condition*))
         (when (typep *nested-debug-condition* 'cell-error)
           ;; what we really want to know when it's e.g. an UNBOUND-VARIABLE:
-          (format *error-output*
+          (format *debug-condition-output*
                   "~&(CELL-ERROR-NAME ~S) = ~S~%"
                   '*nested-debug-condition*
                   (cell-error-name *nested-debug-condition*)))))
@@ -1345,8 +1369,8 @@ the current thread are replaced with dummy objects which can safely escape."
     (let ((background-p (sb-thread::debugger-wait-until-foreground-thread
                          *debug-io*)))
 
-      ;; After the initial error/condition/whatever announcement to
-      ;; *ERROR-OUTPUT*, we become interactive, and should talk on
+      ;; After the initial error/condition/whatever announcement,
+      ;; we're indisputably interactive, and should talk on
       ;; *DEBUG-IO* from now on. (KLUDGE: This is a normative
       ;; statement, not a description of reality.:-| There's a lot of
       ;; older debugger code which was written to do i/o on whatever
@@ -1354,18 +1378,21 @@ the current thread are replaced with dummy objects which can safely escape."
       ;; been converted to behave this way. -- WHN 2000-11-16)
       (flet ((debug ()
                (unwind-protect
-                    (let ( ;; We used to bind *STANDARD-OUTPUT* to *DEBUG-IO*
-                          ;; here as well, but that is probably bogus since it
-                          ;; removes the users ability to do output to a redirected
-                          ;; *S-O*. Now we just rebind it so that users can temporarily
-                          ;; frob it. FIXME: This and other "what gets bound when"
-                          ;; behaviour should be documented in the manual.
-                          (*standard-output* *standard-output*)
-                          ;; This seems reasonable: e.g. if the user has redirected
-                          ;; *ERROR-OUTPUT* to some log file, it's probably wrong
-                          ;; to send errors which occur in interactive debugging to
-                          ;; that file, and right to send them to *DEBUG-IO*.
-                          (*error-output* *debug-io*))
+                   (let (;; We used to bind *STANDARD-OUTPUT* to *DEBUG-IO*
+                         ;; here as well, but that is probably bogus since it
+                         ;; removes the users ability to do output to a redirected
+                         ;; *S-O*. Now we just rebind it so that users can temporarily
+                         ;; frob it. FIXME: This and other "what gets bound when"
+                         ;; behaviour should be documented in the manual.
+                         ;; (FIXME: "rebind it so the user can temporarily frob it"
+                         ;; would apply to any special, so it's unclear why standard
+                         ;; output alone ought to get rebound here.)
+                         (*standard-output* *standard-output*)
+                         ;; Rebind the sink to the debugger writes conditions, so
+                         ;; errors during debugging show up on debug I/O. (This is
+                         ;; effectively a way of saying that nested debuggers are
+                         ;; always conceptually interactive from start to finish.)
+                         (*debug-condition-output* *debug-io*))
                       (unless (typep condition 'step-condition)
                         (when *debug-beginner-help-p*
                           (format *debug-io*
@@ -1543,6 +1570,10 @@ and LDB (the low-level debugger).  See also ENABLE-DEBUGGER."
                       (push name names-used))))
              (incf count))))))
 
+;; FIXME: does this exist so that you might be able to recover while
+;; hacking on DEBUG-LOOP-FUN? (If it's so that you can install an
+;; alternative to DEBUG-LOOP-FUN, it'd be good to explain which
+;; variable rebindings and state cleanups an alternative must do.)
 (defvar *debug-loop-fun* #'debug-loop-fun
   "A function taking no parameters that starts the low-level debug loop.")
 

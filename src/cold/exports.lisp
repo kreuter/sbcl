@@ -3278,6 +3278,7 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*.")
            "*TRACE-REPORT-DEFAULT*"
            "FRAME-HAS-DEBUG-TAG-P"
            "UNWIND-TO-FRAME-AND-CALL"
+           "*DEBUG-CONDITION-OUTPUT*"
            ;; Deprecated
 
            "BACKTRACE" "BACKTRACE-AS-LIST"
