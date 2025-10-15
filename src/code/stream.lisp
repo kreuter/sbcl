@@ -294,7 +294,7 @@
 
 ;;;; input functions
 
-(defun ansi-stream-read-line-from-frc-buffer (stream eof-error-p eof-value)
+(defun ansi-stream-read-line-from-frc-buffer (stream)
   (prepare-for-fast-read-char stream
     (declare (ignore %frc-method%))
     (declare (type ansi-stream-cin-buffer %frc-buffer%))
@@ -333,7 +333,7 @@
           ;; EOF had been reached before we read anything
           ;; at all. Return the EOF value or signal the error.
             (progn (done-with-fast-read-char)
-                   (eof-or-lose stream eof-error-p (values eof-value t))))))))
+                   (values "" t)))))))
 
 ;; to potentially avoid consing a buffer on successive calls to read-line
 ;; (just consing the result string)
@@ -341,48 +341,52 @@
 (declaim (list *read-line-buffers*))
 
 (declaim (inline ansi-stream-read-line))
-(defun ansi-stream-read-line (stream eof-error-p eof-value)
+(defun ansi-stream-read-line (stream &aux n-cin)
   (declare (sb-c::tlab :system))
-  (if (ansi-stream-cin-buffer stream)
-      ;; Stream has a fast-read-char buffer. Copy large chunks directly
-      ;; out of the buffer.
-      (ansi-stream-read-line-from-frc-buffer stream eof-error-p eof-value)
-      ;; Slow path, character by character.
-      ;; There is no need to use PREPARE-FOR-FAST-READ-CHAR
-      ;; because the CIN-BUFFER is known to be NIL.
-      (let ((ch (funcall (ansi-stream-in stream) stream nil 0)))
-        (case ch
-          (#\newline (values "" nil))
-          (0 (values (eof-or-lose stream eof-error-p eof-value) t))
-          (t
-           (let* ((buffer (or (atomic-pop *read-line-buffers*)
-                              (make-string 128)))
-                  (res buffer)
-                  (len (length res))
-                  (eof)
-                  (index 0))
-             (declare (type (simple-array character (*)) buffer))
-             (declare (optimize (sb-c:insert-array-bounds-checks 0)))
-             (declare (index index))
-             (setf (schar res index) (truly-the character ch))
-             (incf index)
-             (loop (case (setq ch (funcall (ansi-stream-in stream) stream nil 0))
-                     (#\newline (return))
-                     (0 (return (setq eof t)))
-                     (t
-                      (when (= index len)
-                        (setq len (* len 2))
-                        (let ((new (make-string len)))
-                          (replace new res)
-                          (setq res new)))
-                      (setf (schar res index) (truly-the character ch))
-                      (incf index))))
-             (if (eq res buffer)
-                 (setq res (subseq buffer 0 index))
-                 (%shrink-vector res index))
-             ;; Do not push an enlarged buffer, only the original one.
-             (atomic-push buffer *read-line-buffers*)
-             (values res eof)))))))
+  (cond ((ansi-stream-cin-buffer stream)
+         ;; Stream has a fast-read-char buffer. Copy large chunks directly
+         ;; out of the buffer.
+         (ansi-stream-read-line-from-frc-buffer stream))
+        ((setq n-cin (ansi-stream-n-cin stream))
+         ;; This stream handles READ-LINE itself.
+         (funcall n-cin stream))
+        (t
+         ;; Slow path, character by character.
+         ;; There is no need to use PREPARE-FOR-FAST-READ-CHAR
+         ;; because the CIN-BUFFER is known to be NIL.
+         (let ((ch (funcall (ansi-stream-in stream) stream nil 0)))
+           (case ch
+             (#\newline (values "" nil))
+             (0 (values "" t))
+             (t
+              (let* ((buffer (or (atomic-pop *read-line-buffers*)
+                                 (make-string 128)))
+                     (res buffer)
+                     (len (length res))
+                     (eof)
+                     (index 0))
+                (declare (type (simple-array character (*)) buffer))
+                (declare (optimize (sb-c:insert-array-bounds-checks 0)))
+                (declare (index index))
+                (setf (schar res index) (truly-the character ch))
+                (incf index)
+                (loop (case (setq ch (funcall (ansi-stream-in stream) stream nil 0))
+                        (#\newline (return))
+                        (0 (return (setq eof t)))
+                        (t
+                         (when (= index len)
+                           (setq len (* len 2))
+                           (let ((new (make-string len)))
+                             (replace new res)
+                             (setq res new)))
+                         (setf (schar res index) (truly-the character ch))
+                         (incf index))))
+                (if (eq res buffer)
+                    (setq res (subseq buffer 0 index))
+                    (%shrink-vector res index))
+                ;; Do not push an enlarged buffer, only the original one.
+                (atomic-push buffer *read-line-buffers*)
+                (values res eof))))))))
 
 (defun read-line (&optional (stream *standard-input*) (eof-error-p t) eof-value
                             recursive-p)
@@ -390,9 +394,15 @@
   (declare (ignore recursive-p))
   (stream-api-dispatch (stream :input)
     :simple (s-%read-line stream eof-error-p eof-value)
-    :native (ansi-stream-read-line stream eof-error-p eof-value)
+    :native
+        (multiple-value-bind (string eof) (ansi-stream-read-line stream)
+          (if (and eof (zerop (length string)))
+              (values (eof-or-lose stream eof-error-p eof-value) t)
+              (values string eof)))
     :gray
         (multiple-value-bind (string eof) (stream-read-line stream)
+          ;; FIXME: a buggy method could allow READ-LINE to return any
+          ;; sequence. We should check that STRING is a string.
           (if (and eof (zerop (length string)))
               (values (eof-or-lose stream eof-error-p eof-value) t)
               (values string eof)))))
@@ -671,6 +681,24 @@
                             count))
            (setf (ansi-stream-in-index stream) (1+ start))
            (aref ibuf start)))))
+
+;; A helper for synonym and two-way streams, which simply forward to a
+;; single input component.
+;;
+;; Note: for backward compatibility with the fall-through case in
+;; ANSI-STREAM-READ-LINE, this returns a (SIMPLE-BASE-STRING 0) for
+;; empty lines, but a (SIMPLE-ARRAY CHARACTER (*)) for non-empty
+;; lines. CONCATENATED-N-CIN, STRING-IN-N-CIN, and ECHO-N-CIN follow
+;; the same convention. (This is probably a FIXME, honestly.)
+(declaim (inline read-some-chars))
+(defun read-some-chars (stream &optional string start end)
+  (if string
+      (read-sequence string stream :start start :end end)
+      (multiple-value-bind (line eof)
+          (read-line stream nil "")
+        (if (zerop (length line))
+            (values "" eof)
+            (values (coerce line '(simple-array character (*))) eof)))))
 
 ;;; output functions
 
@@ -975,6 +1003,8 @@
   (in-fun synonym-in read-char eof-error-p eof-value)
   (in-fun synonym-bin read-byte eof-error-p eof-value)
   (in-fun synonym-n-bin read-n-bytes buffer sbuffer start end eof-error-p))
+(defun synonym-n-cin (stream &optional string start end)
+  (read-some-chars (symbol-value (synonym-stream-symbol stream)) string start end))
 
 (defun synonym-misc (stream operation arg1)
   (declare (optimize (safety 1)))
@@ -1011,6 +1041,7 @@
                       (in #'two-way-in)
                       (bin #'two-way-bin)
                       (n-bin #'two-way-n-bin)
+                      (n-cin #'two-way-n-cin)
                       (cout #'two-way-out)
                       (bout #'two-way-bout)
                       (sout #'two-way-sout)
@@ -1056,6 +1087,8 @@
   (in-fun two-way-in read-char eof-error-p eof-value)
   (in-fun two-way-bin read-byte eof-error-p eof-value)
   (in-fun two-way-n-bin read-n-bytes buffer sbuffer start end eof-error-p))
+(defun two-way-n-cin (stream &optional string start end)
+  (read-some-chars (two-way-stream-input-stream stream) string start end))
 
 (defun two-way-misc (stream operation arg1)
   (let* ((in (two-way-stream-input-stream stream))
@@ -1105,6 +1138,7 @@
                       (in #'concatenated-in)
                       (bin #'concatenated-bin)
                       (n-bin #'concatenated-n-bin)
+                      (n-cin #'concatenated-n-cin)
                       (misc #'concatenated-misc))
             (:constructor %make-concatenated-stream (list))
             (:copier nil)
@@ -1158,6 +1192,60 @@
         (return end)))
     (setf (concatenated-stream-list stream) (cdr streams))))
 
+(defun concatenated-n-cin (stream &optional string start end)
+  (let ((current (first (concatenated-stream-list stream))))
+    (if (null string)
+        ;; We're READ-LINE
+        ;; See the Note above READ-SOME-CHARS re: result types.
+        (if (null current)
+            (values "" t)
+            ;; The ATOMIC-PUSH/-POP in ANSI-STREAM-READ-LINE is
+            ;; noticeably slower than a stack-allocated buffer here
+            (let* ((index 0)
+                   (end 128)
+                   (init (make-string end))
+                   (line init))
+              (declare (dynamic-extent init))
+              (loop
+               (multiple-value-bind (string newline-missing-p)
+                   (read-line current nil "")
+                 (let ((length (length string)))
+                   (when (plusp length)
+                     (when (> (+ length index) end)
+                       (setq line (replace (make-string (* 2 end)) line
+                                           :end2 index)
+                             end (* 2 end)))
+                     (string-dispatch
+                      (simple-base-string
+                       #+sb-unicode simple-character-string)
+                      string
+                      (replace line string :start1 index)
+                      (incf index length))))
+                 (when (or (not newline-missing-p)
+                           (null
+                            (setq current
+                                  (pop (concatenated-stream-list stream)))))
+                   (return
+                     (values (cond ((zerop index)
+                                    "")
+                                   ((eq init line)
+                                    (subseq line 0 index))
+                                   (t (%shrink-vector line index)))
+                             newline-missing-p)))))))
+
+        ;; We're READ-SEQUENCE.
+        ;; TODO(?): sb-simple-streams adds a PARTIAL-FILL argument to
+        ;; READ-SEQUENCE. If there were a desire to forward that
+        ;; argument through here, I guess this should return the
+        ;; first time a READ-SEQUENCE call increases START.
+        (loop
+          (setq start (read-sequence string current :start start :end end))
+          (when (= start end)
+            (return start))
+          (pop (concatenated-stream-list stream))
+          (unless (setq current (first (concatenated-stream-list stream)))
+            (return start))))))
+
 (defun concatenated-misc (stream operation arg1)
   (let* ((left (concatenated-stream-list stream))
          (current (car left)))
@@ -1199,7 +1287,8 @@
                       (in #'echo-in)
                       (bin #'echo-bin)
                       (misc #'echo-misc)
-                      (n-bin #'echo-n-bin))
+                      (n-bin #'echo-n-bin)
+                      (n-cin #'echo-n-cin))
             (:constructor %make-echo-stream (input-stream output-stream))
             (:copier nil)
             (:predicate nil))
@@ -1275,7 +1364,8 @@
 ;;;; STRING-INPUT-STREAM stuff
 
 (defstruct (string-input-stream
-             (:include ansi-stream (misc #'string-in-misc))
+             (:include ansi-stream (misc #'string-in-misc)
+                       (n-cin #'string-in-n-cin))
              (:constructor nil)
              (:copier nil)
              (:predicate nil))
@@ -1288,6 +1378,41 @@
   (start nil :type index :read-only t))
 
 (declaim (freeze-type string-input-stream))
+
+(defun string-in-n-cin (stream &optional seq start end)
+  (let ((string (string-input-stream-string stream))
+        (index (string-input-stream-index stream))
+        (limit (string-input-stream-limit stream)))
+    (if (null seq)
+        ;; We're READ-LINE. See the Note above READ-SOME-CHARS re:
+        ;; result types.
+        (let ((pos (position #\newline string :start index :end limit)))
+          (setf (string-input-stream-index stream) (if pos (1+ pos) limit))
+          (let ((length (- (or pos limit) index)))
+            (values (if (plusp length)
+                        (string-dispatch
+                         (simple-base-string
+                          #+sb-unicode simple-character-string)
+                         string
+                         (replace (make-string length)
+                                  string :start2 index :end2 (or pos limit)))
+                        "")
+                    (if pos nil t))))
+        ;; We're READ-SEQUENCE
+        (let ((count (min (- limit index) (- end start))))
+          (if (zerop count)
+              start
+              (let ((pos (+ start count)))
+                (string-dispatch (simple-base-string
+                                   #+sb-unicode simple-character-string)
+                                 seq
+                  (string-dispatch (simple-base-string
+                                    #+sb-unicode simple-character-string)
+                                   string
+                    (replace seq string :start1 start :end1 pos
+                            :start2 index :end2 (+ index count))))
+                (setf (string-input-stream-index stream) (+ index count))
+                pos))))))
 
 (defun string-in-misc (stream operation arg1)
   (declare (type string-input-stream stream))
@@ -2434,10 +2559,25 @@ benefit of the function GET-OUTPUT-STREAM-STRING."
     (cond
       ((typep seq 'list)
        (read-list (compute-read-function nil)))
-      ((and (ansi-stream-p stream)
-            (ansi-stream-cin-buffer stream)
-            (typep seq 'simple-string))
-       (ansi-stream-read-string-from-frc-buffer seq stream start %end))
+      ((typep seq 'string)
+       (let ((end (or %end (length seq))))
+         (with-array-data ((data seq :offset-var offset)
+                          (offset-start start)
+                          (offset-end end)
+                          :check-fill-pointer t)
+          (if (ansi-stream-p stream)
+              (cond ((ansi-stream-cin-buffer stream)
+                     (- (ansi-stream-read-string-from-frc-buffer
+                         data stream offset-start offset-end)
+                        offset))
+                    ((ansi-stream-n-cin stream)
+                     (- (funcall (ansi-stream-n-cin stream)
+                                 stream data offset-start offset-end)
+                        offset))
+                    (t (read-vector 'read-char data
+                                    offset-start offset-end end)))
+              (read-vector (compute-read-function (array-element-type data))
+                           data offset-start offset-end end)))))
       ((typep seq 'vector)
        (let ((end (or %end (length seq))))
          (with-array-data ((data seq :offset-var offset)

@@ -93,6 +93,30 @@
            ;; before ca. 1.0.27.18, the LET* returned "aa"
            "a")))
 
+;;; The addition of READ-LINE & READ-SEQUENCE into the ANSI-STREAM
+;;; protocol introduces new ways to forget about echo streams'
+;;; state after UNREAD-CHAR.
+(with-test (:name (unread-char read-line echo-stream))
+  (let ((input "abc"))
+    (assert
+     (string=
+      (with-output-to-string (out)
+        (with-input-from-string (in input)
+          (with-open-stream (echo (make-echo-stream in out))
+            (unread-char (read-char echo) echo)
+            (read-line echo))))
+      input))))
+(with-test (:name (unread-char read-sequence echo-stream))
+  (let ((input "abc"))
+    (assert
+     (string=
+      (with-output-to-string (out)
+        (with-input-from-string (in input)
+          (with-open-stream (echo (make-echo-stream in out))
+            (unread-char (read-char echo) echo)
+            (read-sequence (make-string (length input)) echo))))
+      input))))
+
 ;;; Reported by Fredrik Sandstrom to sbcl-devel 2005-05-17 ("Bug in
 ;;; peek-char"):
 ;;; Description: In (peek-char nil s nil foo), if foo happens to be

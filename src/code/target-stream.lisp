@@ -228,6 +228,32 @@
                (call-ansi-stream-misc out operation arg1)
                (stream-misc-dispatch out operation arg1)))))))
 
+(defun echo-n-cin (stream &optional string start end)
+  (let ((in (two-way-stream-input-stream stream))
+        (out (two-way-stream-output-stream stream))
+        (delta (if (echo-stream-unread-stuff stream) 1 0)))
+    (if (null string)
+        ;; We're READ-LINE.
+        (multiple-value-bind (line newline-missing-p)
+            (read-line in nil "")
+          ;; If nothing was read, there's nothing to echo
+          (unless (and (zerop (- (length line) delta)) newline-missing-p)
+            (if newline-missing-p
+                (write-string line out :start delta)
+                (write-line line out :start delta)))
+          (setf (echo-stream-unread-stuff stream) nil)
+          ;; See the Note above READ-SOME-CHARS re: result types.
+          (values (if (zerop (length line))
+                      ""
+                      (coerce line '(simple-array character (*))))
+                  newline-missing-p))
+        ;; We're READ-SEQUENCE
+        (let ((index (read-sequence string in :start start :end end)))
+          (unless (zerop (- index start delta))
+            (write-string string out :start (+ start delta) :end index))
+          (setf (echo-stream-unread-stuff stream) nil)
+          index))))
+
 (defun echo-stream-peek-char (stream peek-type eof-error-p eof-value)
   (let* ((in (two-way-stream-input-stream stream))
          (out (two-way-stream-output-stream stream)))

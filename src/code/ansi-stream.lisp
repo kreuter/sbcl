@@ -152,6 +152,16 @@
                       ;; EOF-ERROR-P, not used by character streams
                       &optional t)
               index))
+  ;; An optional method implementing READ-LINE (when it's a unary
+  ;; call) or READ-SEQUENCE (when the other arguments are a simple
+  ;; string and two bounding indices). The READ-LINE version returns a
+  ;; string and a boolean (same as STREAM-READ-LINE), the other the
+  ;; index after the last frobbed character.
+  (n-cin nil :type
+   (or null
+       (sfunction (stream
+                   &optional (or string null) (or index null) (or index null))
+                  (values (or simple-string index) &optional boolean))))
 
   ;; output functions
   (cout #'ill-out :type (sfunction * t))               ; WRITE-CHAR function
@@ -175,6 +185,7 @@
                                      (in #'synonym-in)
                                      (bin #'synonym-bin)
                                      (n-bin #'synonym-n-bin)
+                                     (n-cin #'synonym-n-cin)
                                      (cout #'synonym-out)
                                      (bout #'synonym-bout)
                                      (sout #'synonym-sout)
