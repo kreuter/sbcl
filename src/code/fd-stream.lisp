@@ -894,6 +894,8 @@
   (replacement nil :type (or null character string (unsigned-byte 8) (simple-array (unsigned-byte 8) 1)))
   (read-n-chars-fun (missing-arg) :type function)
   (read-char-fun (missing-arg) :type function)
+  ;; For ANSI-STREAM-N-CIN. Optional.
+  (read-some-chars-fun nil :type (or null function))
   (write-n-bytes-fun (missing-arg) :type function)
   (write-char-none-buffered-fun (missing-arg) :type function)
   (write-char-line-buffered-fun (missing-arg) :type function)
@@ -1553,6 +1555,7 @@
           (handle-size t)
           fd-stream-read-n-characters
           write-n-bytes-fun
+          read-some-chars-fun
           (newline-variant :lf)
           (char-encodable-p t))
   (let* ((name (first external-format))
@@ -1904,6 +1907,8 @@
         :resync-fun #',resync-function
         :bytes-for-char-fun #',size-function
         :read-c-string-fun #',read-c-string-function
+        ,@(when read-some-chars-fun
+            `(:read-some-chars-fun #',read-some-chars-fun))
         :write-c-string-fun #',output-c-string-function
         :octets-to-string-fun (lambda (&rest rest)
                                 (declare (dynamic-extent rest))
@@ -1986,7 +1991,15 @@
                 (pick-input-routine (if bivalent-stream-p '(unsigned-byte 8)
                                         target-type)
                                     external-format-entry))
-          (unless bin-routine (no-input-routine)))
+          (unless bin-routine (no-input-routine))
+          ;; Maybe this should be an extra value from
+          ;; PICK-INPUT-ROUTINE, but I haven't looked into whether
+          ;; this makes sense for bidirectional streams, and
+          ;; PICK-INPUT-ROUTINE doesn't take a direction.
+          (when (and bivalent-stream-p (not output-p))
+            (let ((n-cin (ef-read-some-chars-fun external-format-entry)))
+              (when n-cin
+                (setf (fd-stream-n-cin fd-stream) n-cin)))))
         (when character-stream-p
           (setf (values cin-routine cin-type cin-size read-n-characters
                         char-size replacement)

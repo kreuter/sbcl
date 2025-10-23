@@ -983,6 +983,130 @@
     sb-vm::simd-copy-utf8-crlf-to-base-string
     :crlf))
 
+;; Scan the input buffer for a word containing linefeed, to use as a
+;; bounding index into IBUF for UTF-8 decoding. (Naturally, this
+;; should be replaced by wider simd instructions wherever
+;; possible. This should suffice as a fallback.)
+(declaim (inline simd-ibuf-find-ascii-lf))
+(defun simd-ibuf-find-ascii-lf (ibuf)
+  (declare (optimize speed (safety 0)))
+  (macrolet ((word-has-linefeed (word)
+               `(let* ((lf #+64-bit #x0a0a0a0a0a0a0a0a
+                           #-64-bit #x0a0a0a0a)
+                       (hi #+64-bit #x8080808080808080
+                           #-64-bit #x80808080)
+                       (lo #+64-bit #x0101010101010101
+                           #-64-bit #x01010101)
+                       (xor (logxor ,word lf))
+                       (sub (- xor lo))
+                       (xnd (logandc1 xor hi)))
+                  (not (zerop (logand sub xnd)))))
+             (find-octet (octet word start end  base-index)
+               `(do* ((i ,start (1+ i))
+                      (j #+little-endian i #+little-endian i
+                         #-little-endian (- sb-vm:n-machine-word-bytes i 1)
+                         #-little-endian (- sb-vm:n-machine-word-bytes i 1)))
+                    ((= i ,end))
+                  (when (= (ldb (byte 8 (* 8 j)) ,word) ,octet)
+                    (return-from
+                     simd-ibuf-find-ascii-lf
+                      ;; this can't be bigger than an FD-STREAM ibuf's size
+                      (the (integer 0 #.+bytes-per-buffer+) (+ ,base-index i)))))))
+    (let* ((head (buffer-head ibuf))
+           (tail (buffer-tail ibuf))
+           (sap (buffer-sap ibuf))
+           (bytes sb-vm:n-machine-word-bytes))
+      (when (< head tail)
+        (multiple-value-bind (wstart before) (floor head bytes)
+          (multiple-value-bind (wend after) (floor tail bytes)
+            (when (plusp before)
+              (let ((word (sap-ref-word sap (* wstart bytes))))
+                (find-octet #x0a word before bytes (* wstart bytes))
+                (incf wstart)))
+            (when (> wend wstart)
+              (do ((windex wstart (1+ windex)))
+                  ((= windex wend))
+                (let ((word (sap-ref-word sap (* windex bytes))))
+                  (when (word-has-linefeed word)
+                    (find-octet #x0a word 0 bytes (* windex bytes))))))
+            (when (plusp after)
+              (let ((word (sap-ref-word sap (* wend bytes))))
+                (find-octet #x0a word 0 after (* wend bytes))))))))))
+
+;; This is very similar to the body of FD-STREAM-READ-SEQUENCE/UTF-8,
+;; except that (1) the INSTEAD processing loop watches for #\Newline,
+;; and (2) it uses SIMD-IBUF-FIND-ASCII-LF to scan for a limit to use
+;; instead of the IBUF's tail. Note that SIMD-IBUF-FIND-ASCII-LF
+;; doesn't check for UTF-8 validity.
+(defun fd-stream-read-line/utf-8 (stream)
+  (declare (optimize speed (safety 0)))
+  (let* ((index 0)
+         (end 128)
+         (init (make-string end))
+         (string init)
+         limit)
+    (declare (dynamic-extent init))
+    (macrolet ((return-result (eofp)
+                 `(return-from fd-stream-read-line/utf-8
+                    (values (if (eq string init)
+                                (subseq init 0 index)
+                                (%shrink-vector string index))
+                            ,eofp))))
+      (tagbody
+        loop
+        (do ((instead (fd-stream-instead stream))
+             char)
+            ((= (fill-pointer instead) 0)
+             (setf (fd-stream-listen stream) nil))
+          (setf char (vector-pop instead))
+          (when (char= char #\newline)
+            (when (= (fill-pointer instead) 0)
+              (setf (fd-stream-listen stream) nil))
+            (return-result nil))
+          (setf (aref string index) char)
+          (incf index)
+          (when (= index end)
+            (return)))
+        (let* ((ibuf (fd-stream-ibuf stream))
+               (head (buffer-head ibuf))
+               (tail (buffer-tail ibuf))
+               (sap (buffer-sap ibuf))
+               incomplete)
+          (declare (type index head tail))
+          (unless limit
+            (setf limit (simd-ibuf-find-ascii-lf ibuf)))
+          (flet ((decode-break (reason)
+                   (setf (buffer-head ibuf) head)
+                   (if (stream-decoding-error-and-handle stream reason 1)
+                       (return-result t)
+                       (go loop))))
+            (let ((tail (or limit tail)))
+              (utf8-char-loop)))
+          (cond ((= index end)
+                 (setf string (replace (make-string (* 2 end)) string)
+                       end (* 2 end)))
+                (limit
+                 (setf (buffer-head ibuf) (1+ limit))
+                 (return-result nil))
+                (t
+                 (unless (catch 'eof-input-catcher (refill-input-buffer stream))
+                   (when (or (not incomplete)
+                             (stream-decoding-error-and-handle stream (- tail head) 1))
+                     (return-result t))))))
+        (go loop)))))
+
+;; This is only the :NEWLINE :LF variant. TODO: :CRLF.
+(defun fd-stream-n-cin/utf-8 (stream &optional string start end)
+  (typecase string
+    #+sb-unicode
+    (simple-base-string
+     (fd-stream-read-sequence/utf-8-to-base-string stream string start end))
+    (string
+     (fd-stream-read-sequence/utf-8-to-string stream string start end))
+    (null
+     (fd-stream-read-line/utf-8 stream))))
+
+
 #+(and sb-unicode 64-bit little-endian
        (not (or arm64 x86-64)))
 (defun sb-vm::simd-copy-character-string-to-utf8 (start end string obuf)
@@ -1156,6 +1280,7 @@
   #+sb-unicode :base-string-direct-mapping #+sb-unicode t
   :fd-stream-read-n-characters fd-stream-read-n-characters/utf-8
   :write-n-bytes-fun output-bytes/utf-8/lf
+  :read-some-chars-fun fd-stream-n-cin/utf-8
   :char-encodable-p (let ((bits (char-code |ch|))) (not (<= #xd800 bits #xdfff)))
   :handle-size nil)
 
