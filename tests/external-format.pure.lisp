@@ -397,12 +397,12 @@
       ;; the requested number of characters, 10, is less than half a CIN
       ;; buffer size. So it gives the right answer.
       (test bad-bytes #\? 10 'character "A?BC" 4)
-      ;; A bivalent stream has no CIN buffer, so this won't call
-      ;; FD-STREAM-READ-SEQUENCE/UTF-8-TO-STRING.
+      ;; A bivalent stream has no CIN buffer, so READ-SEQUENCE will
+      ;; call FD-STREAM-READ-SEQUENCE/UTF-8-TO-STRING.
       (test bad-bytes #\? 10 :default "A?BC" 4)
       ;; But when the stream has a CIN buffer and >256 characters are
       ;; requested, when FD-STREAM-READ-SEQUENCE/UTF-8-TO-STRING
-      ;; encounters a decoding error, it returns NIL, which causes
+      ;; encounters a decoding error, it returned NIL, which causes
       ;; ANSI-STREAM-READ-STRING-FROM-FRC-BUFFER to fall thru to code that
       ;; clobbers the string from the initial START arg.
       (test bad-bytes #\? 257 'character "A?BC" 4) ;; comes out as "?BC", 3 in 2.5.9
@@ -510,6 +510,82 @@
                            "1234567890123456789012345678901234567890123456789")))
           (setf count 0)
           (assert (equal (read-line s nil s) s)))))))
+
+;; More of the same, but with a bivalent UTF-8/LF input stream.
+(with-test (:name (:character-decode :bivalent-utf-8-lf))
+  (macrolet
+      ((test (bytes operation invoke expected)
+         `(progn
+            (with-open-file (s *test-path* :direction :output
+                               :if-exists :supersede :element-type '(unsigned-byte 8))
+              (dolist (byte ',bytes)
+                (write-byte byte s)))
+            (unwind-protect
+                (assert
+                 (equal
+                  ',expected
+                  (sb-ext:with-timeout 5
+                   (with-open-file (s *test-path* :direction :input
+                                    :external-format :utf-8
+                                    :element-type :default)
+                     (handler-bind
+                         ((sb-int:character-decoding-error
+                           (lambda (ignore)
+                             (declare (ignore ignore))
+                             ,invoke)))
+                       ,(ecase operation
+                         (read-line
+                          `(let ((results ()))
+                            (loop
+                              (let ((result (multiple-value-list (read-line s nil nil))))
+                                (if (car result)
+                                    (push result results)
+                                    (return (nreverse results)))))))
+                         (read-sequence
+                          `(let ((buffer (make-string 10 :initial-element #\space)))
+                             (let ((end (read-sequence buffer s)))
+                               (list end (subseq buffer 0 end)))))))))))
+              (delete-file *test-path*)))))
+    (test (65 66 #xE0 67)
+          read-line
+          (invoke-restart 'sb-int::attempt-resync)
+          (("ABC" t)))
+    (test (65 66 #xE0 67)
+          read-line
+          (invoke-restart 'sb-int::force-end-of-file)
+          (("AB" t)))
+    (test (65 66 #xE0 67)
+          read-line
+          (invoke-restart 'sb-impl::input-replacement "xyz")
+          (("ABxyzC" t)))
+    (test (65 66 #xE0 67)
+          read-line
+          (invoke-restart 'sb-impl::input-replacement (string #\newline))
+          (("AB" nil) ("C" t)))
+    (test (65 66 #xE0 67)
+          read-line
+          (invoke-restart 'sb-impl::input-replacement (format nil "xyz~%"))
+          (("ABxyz" nil) ("C" t)))
+    (test (65 66 #xE0 67)
+          read-sequence
+          (invoke-restart 'sb-int::attempt-resync)
+          (3 "ABC"))
+    (test (65 66 #xE0 67)
+          read-sequence
+          (invoke-restart 'sb-int::force-end-of-file)
+          (2 "AB"))
+    (test (65 66 #xE0 67)
+          read-sequence
+          (invoke-restart 'sb-impl::input-replacement "xyz")
+          (6 "ABxyzC"))
+    (test (65 66 #xE0 67)
+          read-sequence
+          (invoke-restart 'sb-impl::input-replacement (string #\newline))
+          (4 #.(format nil "AB~%C")))
+    (test (65 66 #xE0 67)
+          read-sequence
+          (invoke-restart 'sb-impl::input-replacement (format nil "xyz~%"))
+          (7 #.(format nil "ABxyz~%C")))))
 
 ;;; Test character encode restarts.
 (with-open-file (s *test-path* :direction :output
