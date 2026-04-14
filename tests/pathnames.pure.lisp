@@ -1029,20 +1029,12 @@
     (assert (equal ";FOO.LISP" (enough-namestring pathname defaults)))))
 
 (with-test (:name :[-escaping)
-  #-win32
   (progn
-    (assert (pathname-match-p "n" (opaque-identity #p"[n\\]a]")))
-    (assert (pathname-match-p "]" (opaque-identity #p"[n\\]a]")))
-    (assert (pathname-match-p "a" (opaque-identity #p"[n\\]a]")))
-    (assert (not (pathname-match-p "c" (opaque-identity #p"[n\\]a]"))))
-    (assert (pathname-match-p "ab" (opaque-identity #p"[n\\]a]b"))))
-  #+win32
-  (progn
-    (assert (pathname-match-p "n" (opaque-identity #p"[n^]a]")))
-    (assert (pathname-match-p "]" (opaque-identity #p"[n^]a]")))
-    (assert (pathname-match-p "a" (opaque-identity #p"[n^]a]")))
-    (assert (not (pathname-match-p "c" (opaque-identity #p"[n^]a]"))))
-    (assert (pathname-match-p "ab" (opaque-identity #p"[n^]a]b")))))
+    (assert (pathname-match-p "n" (opaque-identity #p"[]na]")))
+    (assert (pathname-match-p "]" (opaque-identity #p"[]na]")))
+    (assert (pathname-match-p "a" (opaque-identity #p"[]na]")))
+    (assert (not (pathname-match-p "c" (opaque-identity #p"[]na]"))))
+    (assert (pathname-match-p "ab" (opaque-identity #p"[]na]b")))))
 
 (with-test (:name :dot-escaping)
   #-win32

@@ -51,115 +51,226 @@
 ;;;
 ;;; Any of these special characters can be preceded by an escape
 ;;; character to cause it to be treated as a regular character.
-(defun remove-escape-characters (namestr start end escape-char)
-  "Remove any occurrences of escape characters from the string
-   because we've already checked for whatever they may have
-   protected."
-  (declare (type simple-string namestr)
-           (type index start end))
-  (let* ((result (make-string (- end start) :element-type 'character))
-         (dst 0)
-         (quoted nil))
-    (do ((src start (1+ src)))
-        ((= src end))
-      (cond (quoted
-             (setf (schar result dst) (schar namestr src))
-             (setf quoted nil)
-             (incf dst))
-            (t
-             (let ((char (schar namestr src)))
-               (cond ((char= char escape-char)
-                      (setq quoted t))
-                     (t
-                      (setf (schar result dst) char)
-                      (incf dst)))))))
-    (when quoted
-      (error 'namestring-parse-error
-             :complaint "escape char in a bad place"
-             :namestring namestr
-             :offset (1- end)))
-    (%shrink-vector result dst)))
 
-(defun maybe-make-pattern (namestr start end escape-char)
-  (declare (type simple-string namestr)
+
+;; The idea here is to parse strictly left-to-right, breaking up the
+;; string into pattern pieces, which we eventually simplify. As we go,
+;; we keep track of the last piece with an unescaped dot. An unescaped
+;; left-bracket causes us to parse characters differently, because
+;; that's how left bracket works in the Unix shell notation we're
+;; emulating. Some stray issues include making sure that every string
+;; we construct is as small as possible for its contents, and
+;; normalizing the contents between brackets into an order that makes
+;; (pathname-match-p #P"[ab]" #p"[ba]") come out true and makes
+;; (namestring (parse-namestring "[a-z]")) => "[az-]", which should
+;; match the same files in a Unix shell as it does in Unix.
+(defun maybe-make-pattern (string start end escape &optional type-separator)
+  (declare (type simple-string string)
            (type index start end)
-           (type character escape-char))
-  (collect ((pattern))
-    (let ((quoted nil)
-          (any-quotes nil)
-          (last-regular-char nil)
-          (index start))
-      (labels ((regulars ()
-                 (if any-quotes
-                     (remove-escape-characters namestr last-regular-char
-                                               index escape-char)
-                     (subseq namestr last-regular-char index)))
-               (flush-pending-regulars ()
-                 (when last-regular-char
-                   (pattern (regulars))
-                   (setf any-quotes nil)
-                   (setf last-regular-char nil))))
-        (loop
-         (when (>= index end)
-           (return))
-         (let ((char (schar namestr index)))
-           (cond (quoted
-                  (incf index)
-                  (setf quoted nil))
-                 ((char= char escape-char)
-                  (setf quoted t)
-                  (setf any-quotes t)
-                  (unless last-regular-char
-                    (setf last-regular-char index))
-                  (incf index))
-                 ((char= char #\?)
-                  (flush-pending-regulars)
-                  (pattern :single-char-wild)
-                  (incf index))
-                 ((char= char #\*)
-                  (flush-pending-regulars)
-                  (pattern :multi-char-wild)
-                  (incf index))
-                 ((char= char #\[)
-                  (flush-pending-regulars)
-                  (let ((close-bracket
-                          (loop with escaping = nil
-                                for i from index below end
-                                for char = (char namestr i)
-                                thereis (cond (escaping
-                                               (setf escaping nil))
-                                              ((char= char escape-char)
-                                               (setf escaping t)
-                                               nil)
-                                              ((char= char #\])
-                                               i)))))
-                    (unless close-bracket
-                      (error 'namestring-parse-error
-                             :complaint "#\\[ with no corresponding #\\]"
-                             :namestring namestr
-                             :offset index))
-                    (pattern (cons :character-set
-                                   (subseq namestr
-                                           (1+ index)
-                                           close-bracket)))
-                    (setf index (1+ close-bracket))))
-                 (t
-                  (unless last-regular-char
-                    (setf last-regular-char index))
-                  (incf index)))))
-        (cond ((null (pattern))
-               (if last-regular-char
-                   (regulars)
-                   ""))
-              ((progn
-                 (flush-pending-regulars)
-                 (null (cdr (pattern))))
-               (let ((piece (first (pattern))))
-                 (if (eq piece :multi-char-wild)
-                     :wild
-                     (make-pattern (pattern)))))
-              (t
-               (make-pattern (pattern))))))))
+           (type character escape))
+  (let ((index start) (orig-start start) char
+        pieces last-dotted-piece last-dotted-pos (nescs 0) dotpos extcharsp)
+    (labels (;; First pass: split the string into pieces, in general..
+             (parse-pieces ()
+               (loop
+                 (when (= index end)
+                   (maybe-push-piece)
+                   (return))
+                 (case (setq char (schar string index))
+                   (#\? (maybe-push-piece)
+                        (maybe-push-piece :single-char-wild))
+                   (#\* (maybe-push-piece)
+                        (maybe-push-piece :multi-char-wild))
+                   (#\[ (multiple-value-bind (piece new-index)
+                            (bracket (1+ index))
+                          (when piece
+                            (maybe-push-piece)
+                            (maybe-push-piece piece new-index))))
+                   (t (cond ((char= char escape)
+                             (incf index)
+                             ;; Count escapes so we can construct a string
+                             ;; of the correct length in MAYBE-PUSH-PIECE.
+                             (incf nescs)
+                             ;; We could alternatively treat a
+                             ;; trailing slash as a literal, e.g.,
+                             ;; parse "a\\" to #P"a\\\\".
+                             (when (= index end)
+                               (error 'namestring-parse-error
+                                      :complaint "escape char in a bad place"
+                                      :namestring string
+                                      :offset (1- end))))
+                            ((eql char type-separator)
+                             ;; We say leading dot isn't a type sep.
+                             (unless (= index orig-start)
+                               ;; DOTPOS is the position in the piece
+                               ;; to be created, not in STRING itself.
+                               (setq dotpos (- index start nescs)))))
+                      ;; Separately, track whether we see extended
+                      ;; chars so we can build base strings in
+                      ;; MAYBE-PUSH-PIECE.
+                      (unless (typep char 'base-char)
+                        (setq extcharsp t))
+                      (incf index)))))
+             ;; Turn PIECES into name and maybe type components.
+             (finish-pieces ()
+               (if (not last-dotted-piece)
+                   (values (simplify-pieces (nreverse pieces))
+                           nil
+                           :newest)
+                   (multiple-value-bind (name-last type-first)
+                       (maybe-split-dotted last-dotted-piece last-dotted-pos)
+                     (let* ((piece-pos (position last-dotted-piece pieces))
+                            (name-head (nreverse
+                                        (subseq pieces (1+ piece-pos))))
+                            (name (cond ((not name-last)
+                                         name-head)
+                                        ((and (zerop (length name-last))
+                                              name-head)
+                                         name-head)
+                                        (t (nconc name-head (list name-last)))))
+                            (type-tail (nreverse (subseq pieces 0 piece-pos)))
+                            (type (cond ((not type-first)
+                                         type-tail)
+                                        ((and (zerop (length type-first))
+                                              type-tail)
+                                         type-tail)
+                                        (t (nconc
+                                            (list type-first) type-tail)))))
+                       (values (simplify-pieces name)
+                               (simplify-pieces type)
+                               :newest)))))
+             (maybe-push-piece (&optional piece new-index)
+               (cond (piece
+                      (push piece pieces)
+                      (if new-index
+                          (setq index new-index start new-index)
+                          (setq index (1+ index) start index)))
+                     ((> index start)
+                      (when (and (= start orig-start) (= index end))
+                        ;; No wildcards in namestring: we're done.
+                        (multiple-value-bind (name type)
+                            (if (zerop nescs)
+                                (maybe-split-dotted
+                                 string (when dotpos (+ start dotpos)) start end)
+                                (maybe-split-dotted
+                                 (unescape string start index nescs extcharsp)
+                                 dotpos))
+                          (return-from maybe-make-pattern
+                            (values name type :newest))))
+                      (let ((piece
+                             (if (zerop nescs)
+                                 (substr string start index extcharsp)
+                                 (unescape string start index nescs extcharsp))))
+                         (push piece pieces)
+                         ;; Remember the last dotted piece.
+                         (when dotpos
+                           (setq last-dotted-piece piece
+                                 last-dotted-pos dotpos))
+                         ;; Reset variables for PARSE-PIECES
+                         (setq nescs 0 dotpos nil extcharsp nil)))))
+             (maybe-split-dotted (string maybe-dotpos &optional (start 0) end)
+               (if (not maybe-dotpos)
+                   (values (subseq string start end) nil)
+                   (values (subseq string start maybe-dotpos)
+                           (subseq string (1+ maybe-dotpos) end))))
+             (simplify-pieces (pieces)
+               (etypecase pieces
+                 (null nil)
+                 ((cons t null)
+                  (let ((thing (car pieces)))
+                    (typecase thing
+                      ((eql :multi-char-wild) :wild)
+                      (string thing)
+                      (t (sb-impl::make-pattern pieces)))))
+                 (t (sb-impl::make-pattern pieces))))
+             ;; Parse and normalize bracket notation so that (a)
+             ;; "[ab]" and "[ba]" both parse to #P"[ab]", and (b) more
+             ;; complicated cases unparse to a notation that will mean
+             ;; to a Unix shell what SBCL has it mean, e.g., "[a-b]"
+             ;; parses to "[ab-]". Note that most characers are
+             ;; literals between brackets.
+             (bracket (start &aux (index index) (bits 0) extcharsp)
+               (loop
+                 (case (setq char (schar string index))
+                   (#\] (if (= index start)
+                            (setq bits (logior bits 1))
+                            (return)))
+                   ;; To a Unix shell, a leading #\! negates the
+                   ;; following.  The PATTERN type doesn't do
+                   ;; negations, but we'll keep track of #\!.
+                   (#\! (setq bits (logior bits 2)))
+                   ;; The PATTERN type doesn't do ranges, either.
+                   (#\- (setq bits (logior bits 4)))
+                   ;; We also don't support character classes,
+                   ;; collating symbols, or equivalence classes. Guess
+                   ;; we could detect that notation and error.
+                   (t (unless (typep char 'base-char)
+                        (setq extcharsp t))))
+                 (when (= (incf index) end)
+                   ;; The Unix handling of '[]' or an unbalanced
+                   ;; left-bracket is to treat the left bracket as a
+                   ;; literal, and resume the parent parsing at the
+                   ;; following character. That would probably be
+                   ;; useful relaxation of the following, which is
+                   ;; backward compatible silliness: it either errors
+                   ;; now, or makes a character set that can't match
+                   ;; anything.  If you wanted to relax it, change
+                   ;; this to
+                   ;; (return-from bracket (values nil (1+ start)))
+                   (if (logbitp 0 bits)
+                       (return-from bracket
+                         (values (cons :character-set "")
+                                 (1+ start)))
+                       (error 'namestring-parse-error
+                              :complaint "#\\[ with no corresponding #\\]"
+                              :namestring string
+                              :offset index))))
+               ;; Produce a normalized result.
+               (let ((chars (delete-duplicates
+                             (substr string start index extcharsp))))
+                 (dolist (c '(#\] #\- #\!))
+                   (setq chars (delete c chars)))
+                 (setq chars (sort chars #'char<))
+                 (values
+                  (cons
+                   :character-set
+                   (if (zerop bits)
+                       chars
+                       (concatenate
+                        (if extcharsp 'string 'base-string)
+                        ;; A "matching list" matches a right square
+                        ;; bracket only if it's first.
+                        (when (logbitp 0 bits) "]")
+                        chars
+                        ;; This exclamation could come second, but
+                        ;; putting it nearly last works.
+                        (when (logbitp 1 bits) "!")
+                        ;; The hyphen must come first or last if it's
+                        ;; to match itself. Last is simplest
+                        (when (logbitp 2 bits) "-"))))
+                  (1+ index))))
+             (unescape (string start end num-escapes extended-chars-p)
+               (do* ((piece (mkstr (- end start num-escapes)
+                                   extended-chars-p))
+                     (in start (1+ in))
+                     (out 0))
+                    ((= in end) piece)
+                 (let ((c (schar string in)))
+                   (when (char= c escape)
+                     (setq c (schar string (incf in))))
+                   (setf (schar piece out) c)
+                   (incf out))))
+             (mkstr (length extended-chars-p)
+               (if extended-chars-p
+                   (make-string length)
+                   (make-string length :element-type 'base-char)))
+             (substr (string start end extended-chars-p)
+               (if extended-chars-p
+                   (subseq string start end)
+                   (replace (mkstr (- end start) nil)
+                            string :start2 start :end2 end))))
+      (parse-pieces)
+      (finish-pieces))))
 
 (declaim (ftype (sfunction ((or (eql :wild) simple-string pattern) character &key (:escape-dot t))
                            simple-string)
@@ -259,24 +370,8 @@
          (lambda (other)
            (equal piece other)))))
 
-(defun extract-name-type-and-version (namestr start end escape-char)
-  (declare (type simple-string namestr)
-           (type index start end))
-  (let ((last-dot
-          (loop for i from (1- end) downto (1+ start)
-                when (and (char= (aref namestr i) #\.)
-                          (evenp (loop for i from (1- i) downto start
-                                       while (char= (char namestr i) escape-char)
-                                       count t)))
-                return i)))
-    (if last-dot
-        (values (maybe-make-pattern namestr start last-dot escape-char)
-                (maybe-make-pattern namestr (1+ last-dot) end escape-char)
-                :newest)
-        (values (maybe-make-pattern namestr start end escape-char)
-                nil
-                :newest))))
-
+(defun extract-name-type-and-version (string start end escape)
+  (maybe-make-pattern string start end escape #\.))
 
 ;;;; Grabbing the kind of file when we have a native-namestring.
 (defun native-file-kind (namestring &optional resolve-symlinks)
